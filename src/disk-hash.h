@@ -1,0 +1,756 @@
+/*
+ * disk-hash.h
+ *
+ *  Created on: 2011-7-20
+ *      Author: badboy
+ */
+
+#ifndef DISK_HASH_H_
+#define DISK_HASH_H_
+
+#include <stdint.h>
+#include <stdio.h>
+#include "config.h"
+#include "storage-manager.h"
+#include "metadata.h"
+#include "list.h"
+
+
+struct disk_hash_seg_header
+{
+	uint64_t previous;
+	uint64_t next;
+};
+
+struct disk_hash_node
+{
+	char fingerprint[FINGERPRINT_LEN];
+	uint32_t data_len;
+	uint64_t data_offset;
+	uint64_t mtdata_offset;
+};
+
+#define DISKHASH_PER_SEG ((SEG_SIZE - sizeof(struct disk_hash_seg_header))/ sizeof(struct disk_hash_node))
+
+struct hash_bucket
+{
+	struct disk_hash_seg_header header;
+	uint32_t seg_stored_len;
+	uint32_t len;
+	uint32_t big_len;
+	uint64_t write_offset;
+	uint64_t cur_seg_offset;
+	struct disk_hash_node disk_hash_node[MEM_HASH_NUM];
+	struct disk_hash_node big_disk_hash_node[BIG_MEM_HASH_NUM];
+};
+
+struct disk_hash
+{
+	struct storage_manager * manager;
+	char read_seg[SEG_SIZE];
+	struct hash_bucket hash_bucket[BUCKET_NUM];
+//	struct my_lock lock;
+};
+
+struct mem_hash_node
+{
+	struct metadata mtdata;
+	struct disk_hash_node dnode;
+	int chain_offset;
+	int chai_id;
+	int load_cache_index;
+	char dup;
+	int cache_count;
+	char result;
+	char data[MAX_CHUNK_LEN];
+	struct list list;
+	struct mem_hash_node * innter_dup;
+	struct mem_hash_node * pre;
+	struct mem_hash_node * next;
+};
+
+struct mem_hash_bucket
+{
+	struct mem_hash_node node[FH_LEN];
+	struct list head;
+	struct list free;
+	struct list result;
+	struct list inner_dup;
+};
+
+struct mem_hash
+{
+	struct mem_hash_bucket mem_bucket[BUCKET_NUM];
+	struct mem_hash_node head;
+	char first_cache;
+	int cache_miss;
+};
+
+int disk_hash_init(struct disk_hash * disk_hash)
+{
+	int i;
+	if(NULL == disk_hash)
+		return -1;
+//	init_mylock(&disk_hash->lock);
+	for(i = 0 ; i < BUCKET_NUM ; i ++)
+	{
+		disk_hash->hash_bucket[i].seg_stored_len = 0;
+		disk_hash->hash_bucket[i].header.previous = 0XFFFFFFFFFFFFFFFF;
+//		disk_hash->hash_bucket[i].header.previous = 0x0;
+		disk_hash->hash_bucket[i].len = 0;
+		disk_hash->hash_bucket[i].big_len = 0;
+		disk_hash->hash_bucket[i].cur_seg_offset = get_new_seg(disk_hash->manager);
+		disk_hash->hash_bucket[i].write_offset = disk_hash->hash_bucket[i].cur_seg_offset;
+#ifdef DIRECT_IO
+		simplewrite(disk_hash->hash_bucket[i].write_offset, &disk_hash->hash_bucket[i].header, disk_hash->manager->pg_size, disk_hash->manager);
+#else
+		simplewrite(disk_hash->hash_bucket[i].write_offset, &disk_hash->hash_bucket[i].header, sizeof(struct disk_hash_seg_header), disk_hash->manager);
+#endif
+		disk_hash->hash_bucket[i].write_offset += sizeof(struct disk_hash_seg_header);
+	}
+	return 0;
+}
+
+
+int dnode_quick_sort(struct disk_hash_node * node, int len)
+{
+	struct disk_hash_node key;
+	int left, right;
+	if(len <= 1)
+		return 0;
+	memcpy(&key, &node[0], sizeof(struct disk_hash_node));
+	left = 0;
+	right = len - 1;
+	while(left < right)
+	{
+		while((right > left) && (memcmp(node[right].fingerprint, key.fingerprint, FINGERPRINT_LEN) >= 0))
+			right --;
+		memcpy(&node[left], &node[right], sizeof(struct disk_hash_node));
+		while((left < right) && (memcmp(node[left].fingerprint, key.fingerprint, FINGERPRINT_LEN) <= 0))
+			left ++;
+		memcpy(&node[right], &node[left], sizeof(struct disk_hash_node));
+	}
+	memcpy(&node[right], &key, sizeof(struct disk_hash_node));
+	dnode_quick_sort(node, right);
+	dnode_quick_sort(node + right + 1, len - right - 1);
+	return 0;
+}
+
+int dnode_merge(struct disk_hash_node * node1, int len1, struct disk_hash_node * node2, int len2)
+{
+	int merge_len1, merge_len2, index;
+	struct disk_hash_node node[DISKHASH_PER_SEG];
+	merge_len1 = 0;
+	merge_len2 = 0;
+	index = 0;
+	while((merge_len1 < len1) && (merge_len2 < len2))
+	{
+		if(memcmp(node1[merge_len1].fingerprint, node2[merge_len2].fingerprint, FINGERPRINT_LEN) < 0)
+		{
+			memcpy(&node[index], &node1[merge_len1], sizeof(struct disk_hash_node));
+			merge_len1 ++;
+		}
+		else
+		{
+			memcpy(&node[index], &node2[merge_len2], sizeof(struct disk_hash_node));
+			merge_len2 ++;
+		}
+		index ++;
+	}
+	if(merge_len1 < len1)
+	{
+		memcpy(&node[index], &node1[merge_len1], sizeof(struct disk_hash_node) * (len1 - merge_len1));
+		index += len1 - merge_len1;
+	}
+	else
+	{
+		memcpy(&node[index], &node2[merge_len2], sizeof(struct disk_hash_node) * (len2 - merge_len2));
+		index += len2 - merge_len2;
+	}
+	memcpy(node1, node, sizeof(struct disk_hash_node) * index);
+	return len1 + len2;
+}
+
+int dnode_insert_sort(struct disk_hash_node * node1, int len1, struct disk_hash_node * node2, int len2)
+{
+	int i, j, k;
+	for(i = 0 ; i < len2 ; i ++)
+	{
+		for(j = len1 - 1 ; j >= 0 ; j --)
+		{
+			if(0 < memcmp(node2[i].fingerprint, node1[j].fingerprint, FINGERPRINT_LEN))
+			{
+				break;
+			}
+		}
+		j ++;
+		for(k = len1 ; k > j ; k --)
+		{
+			node1[k] = node1[k -1];
+		}
+		node1[j] = node2[i];
+		len1 ++;
+	}
+	return len1;
+}
+
+int add_2_disk_hash(struct disk_hash * disk_hash, struct disk_hash_node disk_hash_node)
+{
+	uint32_t first_int;
+	uint32_t index;
+	uint32_t left_seg_len;
+	uint32_t left_store_len;
+	uint64_t read_offset;
+	uint64_t read_len;
+	uint32_t read_node_len;
+	uint32_t store_pos;
+	struct timeval start, end;
+	struct disk_hash_node * disk_node;
+	struct disk_hash_node * mem_node;
+	int pos;
+
+//	mylock(&disk_hash->lock);
+
+
+	memcpy((void *)&first_int, (void *) (disk_hash_node.fingerprint), sizeof(uint32_t));
+	index = first_int & DISK_HASH_MASK;
+	if(disk_hash->hash_bucket[index].len >= MEM_HASH_NUM)
+	{
+		gettimeofday(&start, NULL);
+		dnode_quick_sort(disk_hash->hash_bucket[index].disk_hash_node, disk_hash->hash_bucket[index].len);
+		if(disk_hash->hash_bucket[index].big_len > 0)
+		{
+			dnode_merge(disk_hash->hash_bucket[index].big_disk_hash_node, disk_hash->hash_bucket[index].big_len, disk_hash->hash_bucket[index].disk_hash_node, disk_hash->hash_bucket[index].len);
+		}
+		else
+		{
+			memcpy(disk_hash->hash_bucket[index].big_disk_hash_node, disk_hash->hash_bucket[index].disk_hash_node, disk_hash->hash_bucket[index].len * sizeof(struct disk_hash_node));
+		}
+		disk_hash->hash_bucket[index].big_len += disk_hash->hash_bucket[index].len;
+		disk_hash->hash_bucket[index].len = 0;
+		gettimeofday(&end, NULL);
+		rank_time += td(&start, &end);
+		this_rank_time += td(&start, &end);
+		if(disk_hash->hash_bucket[index].big_len >= BIG_MEM_HASH_NUM)
+		{
+			left_store_len = BIG_MEM_HASH_NUM;
+			store_pos = 0;
+			while(left_store_len > 0)
+			{
+				left_seg_len = DISKHASH_PER_SEG - disk_hash->hash_bucket[index].seg_stored_len;
+				if(left_seg_len > left_store_len)
+				{
+#ifdef DIRECT_IO
+					read_offset = disk_hash->hash_bucket[index].cur_seg_offset;
+					read_len = disk_hash->hash_bucket[index].seg_stored_len * sizeof(struct disk_hash_node) + sizeof(struct disk_hash_seg_header);
+					read_len = (0 == read_len % disk_hash->manager->pg_size) ? read_len : read_len /disk_hash->manager->pg_size * disk_hash->manager->pg_size + disk_hash->manager->pg_size;
+#else
+					read_offset = disk_hash->hash_bucket[index].cur_seg_offset + sizeof(struct disk_hash_seg_header);
+					read_len = disk_hash->hash_bucket[index].seg_stored_len * sizeof(struct disk_hash_node);
+#endif
+					disk_node = disk_hash->read_seg + sizeof(struct disk_hash_seg_header);
+					gettimeofday(&start, NULL);
+#ifdef DIRECT_IO
+					simpleread(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+#else
+					simpleread(read_offset, disk_node, read_len, disk_hash->manager);
+#endif
+					gettimeofday(&end, NULL);
+					rank_fread_time += td(&start, &end);
+					this_rank_fread_time += td(&start, &end);
+					read_node_len = disk_hash->hash_bucket[index].seg_stored_len;
+					mem_node = &disk_hash->hash_bucket[index].big_disk_hash_node[store_pos];
+					gettimeofday(&start, NULL);
+					//dnode_quick_sort(mem_node, left_store_len);
+					dnode_merge(disk_node, read_node_len, mem_node, left_store_len);
+					read_node_len += left_store_len;
+					gettimeofday(&end, NULL);
+					rank_time += td(&start, &end);
+					this_rank_time += td(&start, &end);
+#ifdef DIRECT_IO
+					read_len = read_node_len * sizeof(struct disk_hash_node) + sizeof(struct disk_hash_seg_header);
+					read_len = (0 == read_len % disk_hash->manager->pg_size) ? read_len : read_len /disk_hash->manager->pg_size * disk_hash->manager->pg_size + disk_hash->manager->pg_size;
+#else
+					read_len = read_node_len * sizeof(struct disk_hash_node);
+#endif
+					gettimeofday(&start,NULL);
+#ifdef DIRECT_IO
+					simplewrite(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+#else
+					simplewrite(read_offset, disk_node, read_len, disk_hash->manager);
+#endif
+					gettimeofday(&end, NULL);
+					rank_fwrite_time += td(&start, &end);
+					this_rank_fwrite_time += td(&start, &end);
+					//simplewrite(disk_hash->hash_bucket[index].write_offset, &(disk_hash->hash_bucket[index].disk_hash_node[store_pos]), left_store_len * sizeof(struct disk_hash_node), disk_hash->manager);
+					disk_hash->hash_bucket[index].big_len -= left_store_len;
+					disk_hash->hash_bucket[index].seg_stored_len += left_store_len;
+					disk_hash->hash_bucket[index].write_offset += left_store_len * sizeof(struct disk_hash_node);
+					left_store_len -= left_store_len;
+					store_pos += left_store_len;
+				}
+				else
+				{
+#ifdef DIRECT_IO
+					read_offset = disk_hash->hash_bucket[index].cur_seg_offset;
+					read_len = disk_hash->hash_bucket[index].seg_stored_len * sizeof(struct disk_hash_node) + sizeof(struct disk_hash_seg_header);
+					read_len = (0 == read_len % disk_hash->manager->pg_size) ? read_len : read_len /disk_hash->manager->pg_size * disk_hash->manager->pg_size + disk_hash->manager->pg_size;
+#else
+					read_offset = disk_hash->hash_bucket[index].cur_seg_offset + sizeof(struct disk_hash_seg_header);
+					read_len = disk_hash->hash_bucket[index].seg_stored_len * sizeof(struct disk_hash_node);
+#endif
+					disk_node = disk_hash->read_seg + sizeof(struct disk_hash_seg_header);
+					gettimeofday(&start, NULL);
+#ifdef DIRECT_IO
+					simpleread(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+#else
+					simpleread(read_offset, disk_node, read_len, disk_hash->manager);
+#endif
+					gettimeofday(&end, NULL);
+					rank_fread_time += td(&start, &end);
+					this_rank_fread_time += td(&start, &end);
+					read_node_len = disk_hash->hash_bucket[index].seg_stored_len;
+					mem_node = &disk_hash->hash_bucket[index].big_disk_hash_node[store_pos];
+					gettimeofday(&start, NULL);
+					//dnode_quick_sort(mem_node, left_seg_len);
+					dnode_merge(disk_node, read_node_len, mem_node, left_seg_len);
+					read_node_len += left_seg_len;
+					gettimeofday(&end, NULL);
+					rank_time += td(&start, &end);
+					this_rank_time += td(&start, &end);
+#ifdef DIRECT_IO
+					read_len = read_node_len * sizeof(struct disk_hash_node) + sizeof(struct disk_hash_seg_header);
+					read_len = (0 == read_len % disk_hash->manager->pg_size) ? read_len : read_len /disk_hash->manager->pg_size * disk_hash->manager->pg_size + disk_hash->manager->pg_size;
+#else
+					read_len = read_node_len * sizeof(struct disk_hash_node);
+#endif
+					gettimeofday(&start, NULL);
+#ifdef DIRECT_IO
+					simplewrite(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+#else
+					simplewrite(read_offset, disk_node, read_len, disk_hash->manager);
+#endif
+					gettimeofday(&end, NULL);
+					rank_fwrite_time += td(&start, &end);
+					this_rank_fwrite_time += td(&start, &end);
+					//simplewrite(disk_hash->hash_bucket[index].write_offset, &(disk_hash->hash_bucket[index].disk_hash_node[store_pos]), left_seg_len * sizeof(struct disk_hash_node), disk_hash->manager);
+					disk_hash->hash_bucket[index].header.previous = disk_hash->hash_bucket[index].cur_seg_offset;
+					disk_hash->hash_bucket[index].cur_seg_offset = get_new_seg(disk_hash->manager);
+					disk_hash->hash_bucket[index].write_offset = disk_hash->hash_bucket[index].cur_seg_offset;
+
+					gettimeofday(&start, NULL);
+#ifdef DIRECT_IO
+					simplewrite(disk_hash->hash_bucket[index].write_offset, &disk_hash->hash_bucket[index].header, disk_hash->manager->pg_size, disk_hash->manager);
+#else
+					simplewrite(disk_hash->hash_bucket[index].write_offset, &disk_hash->hash_bucket[index].header, sizeof(struct disk_hash_seg_header), disk_hash->manager);
+#endif
+					gettimeofday(&end, NULL);
+					rank_fwrite_time += td(&start, &end);
+					this_rank_fwrite_time += td(&start, &end);
+					disk_hash->hash_bucket[index].write_offset += sizeof(struct disk_hash_seg_header);
+
+					disk_hash->hash_bucket[index].big_len -= left_seg_len;
+					disk_hash->hash_bucket[index].seg_stored_len = 0;
+
+					left_store_len -= left_seg_len;
+					store_pos += left_seg_len;
+				}
+			}
+		}
+	}
+	pos = disk_hash->hash_bucket[index].len;
+	memcpy(&(disk_hash->hash_bucket[index].disk_hash_node[pos]), &disk_hash_node, sizeof(struct disk_hash_node));
+	disk_hash->hash_bucket[index].len ++;
+	return 0;
+}
+
+
+
+
+int lookup_fingerprint_in_disk_hash(struct disk_hash * disk_hash, char fingerprint[FINGERPRINT_LEN], struct disk_hash_node * disk_hash_node)
+{
+	uint32_t first_int;
+	uint32_t index;
+	size_t len;
+	uint32_t read_len;
+	uint64_t read_offset;
+	struct disk_hash_seg_header * header;
+	struct disk_hash_node * node;
+	int i, mid, index1, index2;
+	int ret;
+	struct timeval start, end;
+
+//	mylock(&disk_hash->lock);
+
+	memcpy((void *)&first_int, (void *)fingerprint, sizeof(uint32_t));
+	index = first_int & DISK_HASH_MASK;
+	len = disk_hash->hash_bucket[index].len;
+	for(i = 0 ; i < len ; i ++)
+	{
+		if(0 == memcmp(disk_hash->hash_bucket[index].disk_hash_node[i].fingerprint, fingerprint, FINGERPRINT_LEN))
+		{
+			memcpy(disk_hash_node, &(disk_hash->hash_bucket[index].disk_hash_node[i]), sizeof(struct disk_hash_node));
+			return 1;
+		}
+	}
+
+	len = disk_hash->hash_bucket[index].big_len;
+	node = disk_hash->hash_bucket[index].big_disk_hash_node;
+	index1 = 0;
+	index2 = len - 1;
+	while(index2 >= index1)
+	{
+		mid= (index1 + index2) / 2;
+		ret = memcmp(node[mid].fingerprint, fingerprint, FINGERPRINT_LEN);
+		if(0 == ret)
+		{
+			memcpy(disk_hash_node, &node[mid], sizeof(struct disk_hash_node));
+			return 1;
+		}
+		else
+		{
+			if(ret > 0)
+			{
+				index2 = mid - 1;
+			}
+			else
+			{
+				index1 = mid + 1;
+			}
+		}
+	}
+
+	if(disk_hash->hash_bucket[index].seg_stored_len > 0)
+	{
+		read_len = sizeof(struct disk_hash_node) * disk_hash->hash_bucket[index].seg_stored_len + sizeof(struct disk_hash_seg_header);
+		read_offset = disk_hash->hash_bucket[index].cur_seg_offset;
+	}
+	else
+	{
+		read_len = SEG_SIZE;
+		read_offset = disk_hash->hash_bucket[index].header.previous;
+	}
+	while(0XFFFFFFFFFFFFFFFF != read_offset)
+//	while(0x0 != read_offset)
+	{
+		gettimeofday(&start, NULL);
+		simpleread(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+		gettimeofday(&end, NULL);
+		disk_hash_fread_time += td(&start, &end);
+		this_disk_hash_fread_time += td(&start, &end);
+		disk_hash_fread_times ++;
+		this_disk_hash_fread_times ++;
+		this_disk_hash_fread_len += read_len;
+		disk_hash_fread_len += read_len;
+		if(SEG_SIZE == read_len)
+		{
+			len = DISKHASH_PER_SEG;
+		}
+		else
+		{
+			len = disk_hash->hash_bucket[index].seg_stored_len;
+		}
+		node = (struct disk_hash_node *)(disk_hash->read_seg + sizeof(struct disk_hash_seg_header));
+		index1 = 0;
+		index2 = len - 1;
+		while(index2 >= index1)
+		{
+			mid= (index1 + index2) / 2;
+			ret = memcmp(node[mid].fingerprint, fingerprint, FINGERPRINT_LEN);
+			if(0 == ret)
+			{
+				memcpy(disk_hash_node, &node[mid], sizeof(struct disk_hash_node));
+				return 1;
+			}
+			else
+			{
+				if(ret > 0)
+				{
+					index2 = mid - 1;
+				}
+				else
+				{
+					index1 = mid + 1;
+				}
+			}
+		}
+		read_len = SEG_SIZE;
+		header = (struct disk_hash_seg_header *)disk_hash->read_seg;
+		read_offset = header->previous;
+	}
+	return 0;
+}
+
+int mhnode_list_init(struct mem_hash_node * mnode)
+{
+	mnode->next = mnode;
+	mnode->pre = mnode;
+	return 0;
+}
+
+int mhnode_list_add(struct mem_hash_node * head, struct mem_hash_node * mnode)
+{
+	mnode->next = head;
+	mnode->pre = head->pre;
+
+	head->pre->next = mnode;
+	head->pre = mnode;
+	return 0;
+}
+
+int mhnode_list_del(struct mem_hash_node * mnode)
+{
+	mnode->next->pre = mnode->pre;
+	mnode->pre->next = mnode->next;
+	return 0;
+}
+
+int mh_list_size(struct mem_hash_node * mnode)
+{
+	struct mem_hash_node * tmp;
+	int i;
+	i = 0;
+	tmp = mnode->next;
+	while(tmp != mnode)
+	{
+		i ++;
+		tmp = tmp->next;
+	}
+	return i;
+}
+
+int mem_hash_init(struct mem_hash *mh)
+{
+	int i, j;
+	for(i = 0 ; i < BUCKET_NUM ; i++)
+	{
+		list_init(&mh->mem_bucket[i].head);
+		list_init(&mh->mem_bucket[i].free);
+		list_init(&mh->mem_bucket[i].result);
+		list_init(&mh->mem_bucket[i].inner_dup);
+		for(j = 0 ; j < FH_LEN ; j ++)
+		{
+			list_add(&mh->mem_bucket[i].free, &mh->mem_bucket[i].node[j].list);
+		}
+	}
+	mhnode_list_init(&mh->head);
+	mh->first_cache = 0;
+	mh->cache_miss = 0;
+	return 0;
+}
+
+//char tmp_finger[FINGERPRINT_LEN] = {102,-76,-117,-9,-84,116,-75,25,117,112,-91,32,-75,-63,2,36,109,6,-116,81,};
+
+int mem_hash_lookup(struct disk_hash * disk_hash, struct mem_hash * mh, uint32_t index)
+{
+	uint32_t read_len;
+	int len;
+	uint64_t read_offset;
+	struct disk_hash_seg_header * header;
+	struct disk_hash_node * node;
+	struct mem_hash_node * mnode, *bufmnode;
+	struct list * list, * tmphead, *head, * result, * inner_dup, *buftmplist, *safe, headmem;
+	int i, mid, index1, index2;
+	int ret;
+	struct timeval start, end;
+
+//	mylock(&disk_hash->lock);
+
+#ifdef DISK_HASH_RANK_LOOKUP
+	head = &headmem;
+	list_init(head);
+	tmphead = &mh->mem_bucket[index].head;
+#else
+	head = &mh->mem_bucket[index].head;
+#endif
+	result = &mh->mem_bucket[index].result;
+	inner_dup = &mh->mem_bucket[index].inner_dup;
+
+
+#ifdef DISK_HASH_RANK_LOOKUP
+	//sort and search for duplicate fingerprint in the same chain
+	list_iterate_safe(list, safe, tmphead)
+	{
+		list_del(list);
+		mnode = list_item(list, struct mem_hash_node);
+		mnode->innter_dup = NULL;
+		mnode->result = 0;
+		if(list_empty(head))
+		{
+			list_add(head, list);
+		}
+		else
+		{
+			buftmplist = head->n;
+			bufmnode = list_item(buftmplist, struct mem_hash_node);
+			while((buftmplist != head) && (0 < memcmp(mnode->mtdata.fingerprint, bufmnode->mtdata.fingerprint, FINGERPRINT_LEN)))
+			{
+				buftmplist = buftmplist->n;
+				if(head != buftmplist)
+				{
+					bufmnode = list_item(buftmplist, struct mem_hash_node);
+				}
+			}
+			if(0 == memcmp(mnode->mtdata.fingerprint, bufmnode->mtdata.fingerprint, FINGERPRINT_LEN))
+			{
+				list_add(inner_dup, list);
+				mnode->innter_dup = bufmnode;
+			}
+			else
+			{
+				list_add(buftmplist, list);
+			}
+		}
+	}
+#endif
+
+	len = disk_hash->hash_bucket[index].len;
+//	printf("list len %d\n", list_size(&mh->mem_bucket[index].head));
+	list_iterate_safe(list, safe, head)
+	{
+		mnode = list_item(list, struct mem_hash_node);
+		for(i = 0 ; i < len ; i ++)
+		{
+			ret = memcmp(disk_hash->hash_bucket[index].disk_hash_node[i].fingerprint, mnode->mtdata.fingerprint, FINGERPRINT_LEN);
+			if(0 == ret)
+			{
+				memcpy(&mnode->dnode, &disk_hash->hash_bucket[index].disk_hash_node[i], sizeof(struct disk_hash_node));
+				mnode->dup = 1;
+				mnode->result = 1;
+				list_del(list);
+				list_add(result, list);
+				disk_hash_hit ++;
+				this_disk_hash_hit ++;
+				break;
+			}
+		}
+
+	}
+
+
+	node = disk_hash->hash_bucket[index].big_disk_hash_node;
+	mid = 0;
+	len = disk_hash->hash_bucket[index].big_len;
+	list_iterate_safe(list, safe, head)
+	{
+#ifdef DISK_HASH_RANK_LOOKUP
+		index1 = mid;
+#else
+		index1 = 0;
+#endif
+		index2 = len - 1;
+		mnode = list_item(list, struct mem_hash_node);
+		while(index2 >= index1)
+		{
+			mid= (index1 + index2) / 2;
+			ret = memcmp(node[mid].fingerprint, mnode->mtdata.fingerprint, FINGERPRINT_LEN);
+			if(0 == ret)
+			{
+				memcpy(&mnode->dnode, &node[mid], sizeof(struct disk_hash_node));
+				mnode->dup = 1;
+				mnode->result = 1;
+				list_del(list);
+				list_add(result, list);
+				disk_hash_hit ++;
+				this_disk_hash_hit ++;
+				break;
+			}
+			else
+			{
+				if(ret > 0)
+				{
+					index2 = mid - 1;
+				}
+				else
+				{
+					index1 = mid + 1;
+				}
+			}
+		}
+	}
+
+
+	if(disk_hash->hash_bucket[index].seg_stored_len > 0)
+	{
+		read_len = sizeof(struct disk_hash_node) * disk_hash->hash_bucket[index].seg_stored_len + sizeof(struct disk_hash_seg_header);
+		read_offset = disk_hash->hash_bucket[index].cur_seg_offset;
+	}
+	else
+	{
+		read_len = SEG_SIZE;
+		read_offset = disk_hash->hash_bucket[index].header.previous;
+	}
+	while((0XFFFFFFFFFFFFFFFF != read_offset) && (!list_empty(head)))
+	{
+		gettimeofday(&start, NULL);
+		simpleread(read_offset, disk_hash->read_seg, read_len, disk_hash->manager);
+		gettimeofday(&end, NULL);
+		disk_hash_fread_time += td(&start, &end);
+		this_disk_hash_fread_time += td(&start, &end);
+		disk_hash_fread_times ++;
+		this_disk_hash_fread_times ++;
+		this_disk_hash_fread_len += read_len;
+		disk_hash_fread_len += read_len;
+		if(SEG_SIZE == read_len)
+		{
+			len = DISKHASH_PER_SEG;
+		}
+		else
+		{
+			len = disk_hash->hash_bucket[index].seg_stored_len;
+		}
+		node = (struct disk_hash_node *)(disk_hash->read_seg + sizeof(struct disk_hash_seg_header));
+		mid = 0;
+		list_iterate_safe(list, safe, head)
+		{
+#ifdef DISK_HASH_RANK_LOOKUP
+			index1 = mid;
+#else
+			index1 = 0;
+#endif
+			index2 = len - 1;
+			mnode = list_item(list, struct mem_hash_node);
+			while(index2 >= index1)
+			{
+				mid= (index1 + index2) / 2;
+				ret = memcmp(node[mid].fingerprint, mnode->mtdata.fingerprint, FINGERPRINT_LEN);
+				if(0 == ret)
+				{
+					memcpy(&mnode->dnode, &node[mid], sizeof(struct disk_hash_node));
+					mnode->dup = 1;
+					mnode->result = 1;
+					list_del(list);
+					list_add(result, list);
+					disk_hash_hit ++;
+					this_disk_hash_hit ++;
+					break;
+				}
+				else
+				{
+					if(ret > 0)
+					{
+						index2 = mid - 1;
+					}
+					else
+					{
+						index1 = mid + 1;
+					}
+				}
+			}
+		}
+		read_len = SEG_SIZE;
+		header = (struct disk_hash_seg_header *)disk_hash->read_seg;
+		read_offset = header->previous;
+	}
+	list_iterate_safe(list, safe, head)
+	{
+		mnode = list_item(list, struct mem_hash_node);
+		mnode->dup = 0;
+		mnode->result = 1;
+		list_del(list);
+		list_add(result, list);
+	}
+	return 0;
+}
+
+#endif /* DISK_HASH_H_ */
