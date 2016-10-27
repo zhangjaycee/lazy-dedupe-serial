@@ -98,7 +98,7 @@ int chunk(char * chunk_buf, char * data, size_t len, int cont, int file_end, str
 			if(((abstract % MEAN_CHUNK_LEN) == CHUNK_CDC_R) || (in_chunk_len >= MAX_CHUNK_LEN))//if((abstract & CHUNK_MASK) == CHUNK_MASK)
 			{
 				// a chunk
-				dedup(chunk_buf, in_chunk_len, de_dup);
+				dedup(chunk_buf, in_chunk_len, de_dup);    //startdedup
 				in_chunk_len = 0;
 				chunk_num ++;
 			}
@@ -117,7 +117,7 @@ int chunk(char * chunk_buf, char * data, size_t len, int cont, int file_end, str
 			memcpy(chunk_buf + in_chunk_len, data + parsed_len, cpy_len);
 			in_chunk_len += cpy_len;
 			parsed_len += cpy_len;
-			dedup(chunk_buf, in_chunk_len, de_dup);
+			dedup(chunk_buf, in_chunk_len, de_dup);  //startdedup
 			in_chunk_len = 0;
 			chunk_num ++;
 		}

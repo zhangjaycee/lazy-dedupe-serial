@@ -733,7 +733,7 @@ int dedup(char * buf, uint32_t len, struct dedup_manager * dedup)
 	gettimeofday(&iden_start, NULL);
 	mtdata.len = len;
 	gettimeofday(&start, NULL);
-	ret = bloom_filter_lookup(dedup->bf, mtdata.fingerprint);
+	ret = bloom_filter_lookup(dedup->bf, mtdata.fingerprint);    //bloom filter
 	gettimeofday(&end, NULL);
 	bf_time += td(&start, &end);
 	this_bf_time += td(&start, &end);
@@ -814,7 +814,7 @@ int dedup(char * buf, uint32_t len, struct dedup_manager * dedup)
 	}
 #else
 
-	if(1 == ret)
+	if(1 == ret)    //possibly duplicated
 	{
 		bf_hit ++;
 		this_bf_hit ++;
@@ -848,7 +848,7 @@ int dedup(char * buf, uint32_t len, struct dedup_manager * dedup)
 			this_first_cache_hit ++;
 		}
 	}
-	if(0 == ret)
+	if(0 == ret)   //unique
 	{
 		unique_count ++;
 		if(dup_count != 0)

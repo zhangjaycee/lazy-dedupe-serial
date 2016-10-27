@@ -7,6 +7,7 @@
  Description : Hello World in C, Ansi-style
  ============================================================================
  */
+#define _GUN_SOURCE 
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +21,7 @@
 
 #define READ_LEN (16 * 1024 * 1024)
 
-#define DEBUGFILE "/home/mjw/infofile.txt"
+#define DEBUGFILE "infofile.txt"
 
 int filedebug(char *str)
 {
@@ -294,7 +295,7 @@ int main(int argc, char* argv[])
 	argv ++;argc --; //skip the metadatafile
 
 #ifdef WRITE_FINGER_TO_FILE
-	w_f = fopen("/home/mjw/fingerprint", "wb");
+	w_f = fopen("fingerprint", "wb");
 	if(NULL == w_f)
 	{
 		puts("can not open file");
