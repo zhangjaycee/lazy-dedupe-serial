@@ -821,7 +821,7 @@ int dedup(char * buf, uint32_t len, struct dedup_manager * dedup)
 		need_load_cache = 0;
 		gettimeofday(&start, NULL);
 		//ret = lookup2_in_cache(&dedup->cache, mtdata.fingerprint, &mtdata);
-		ret = lookup_in_cache(&dedup->cache, &mtdata);
+		ret = lookup_in_cache(&dedup->cache, &mtdata);    //look up in cache first
 		cache_times ++;
 		this_cache_times ++;
 		gettimeofday(&end, NULL);

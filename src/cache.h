@@ -176,8 +176,8 @@ int lookup_in_cache(struct cache * cache, struct metadata * mtdata)
 	uint32_t first_int;
 
 	memcpy(&first_int, mtdata->fingerprint, sizeof(uint32_t));
-	index = first_int & CACHE_MASK;
-	head = &cache->cache_bucket[index].list;
+	index = first_int & CACHE_MASK;  // &0x7ff , last 11 bit as hash index, because there is (2^11 = 2048) cache_bucket
+	head = &(cache->cache_bucket[index].list);
 	list_uniterate(list, head, head)
 	{
 		cache_node = list_item(list, struct cache_node);
