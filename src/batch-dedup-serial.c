@@ -7,7 +7,7 @@
  Description : Hello World in C, Ansi-style
  ============================================================================
  */
-#define _GUN_SOURCE 
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>

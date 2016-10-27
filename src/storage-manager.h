@@ -4,7 +4,6 @@
  *  Created on: 2012-7-14
  *      Author: BadBoy
  */
-
 #ifndef STORAGE_MANAGER_H_
 #define STORAGE_MANAGER_H_
 

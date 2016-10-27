@@ -74,7 +74,7 @@ const uint64_t BF_LEN = (1024 * 1024 * 1024);//#define BF_LEN (1024 * 1024 * 102
 #define LOAD_ADVANCE 100
 
 #define FINGER_DEBUG
-//#define WRITE_FINGER_TO_FILE
+#define WRITE_FINGER_TO_FILE
 
 //#define MERGE_LOAD_CACHE
 #define LINE_LOOKUP
